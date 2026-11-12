@@ -5,23 +5,34 @@ declare(strict_types=1);
 namespace Acme\SellerRefund\Model\Pdf;
 
 use Acme\SellerRefund\Api\Data\RefundInterface;
+use Acme\SellerRefund\Api\Data\RefundItemInterface;
 use Acme\SellerRefund\Api\RefundRepositoryInterface;
+use Acme\SellerRefund\Model\SellerLineResolver;
+use Acme\SellerRefund\Model\Tax\TaxCodeResolver;
 use Acme\SellerRefund\Model\Total\RefundTotalCalculator;
 use Magento\Framework\Stdlib\DateTime\TimezoneInterface;
+use Magento\Sales\Api\Data\OrderItemInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
 
 /**
  * Reissued receipt / qualified tax invoice for a refund. Every figure is taken from the
- * stored refund snapshot through the calculator, so the receipt agrees with the other
- * presentation surfaces and the downstream export. Labels are ASCII only.
+ * stored refund snapshot through the canonical calculator, ensuring the receipt agrees with
+ * the other presentation surfaces and downstream export. Per-rate tax groups are derived
+ * strictly from eligible seller lines to support Japanese Qualified Invoicing on both
+ * pure seller and mixed orders. Labels are ASCII only.
  */
 class RefundReceipt
 {
+    private const SCALE = 4;
+    private const ZERO = '0.0000';
+
     public function __construct(
         private readonly RefundRepositoryInterface $refundRepository,
         private readonly OrderRepositoryInterface $orderRepository,
         private readonly RefundTotalCalculator $calculator,
-        private readonly TimezoneInterface $timezone
+        private readonly TimezoneInterface $timezone,
+        private readonly ?SellerLineResolver $sellerLineResolver = null,
+        private readonly ?TaxCodeResolver $taxCodeResolver = null
     ) {
     }
 
@@ -35,6 +46,9 @@ class RefundReceipt
         $items = $this->refundRepository->getItems((int) $refund->getEntityId());
         $order = $this->orderRepository->get($refund->getOrderId());
         $figures = $this->calculator->fromSnapshot($refund, $items, $order);
+
+        $currency = $this->currency($order);
+        $taxGroups = $this->buildTaxGroups($order);
 
         return [
             'refund_no' => $refund->getRefundNo(),
@@ -53,10 +67,82 @@ class RefundReceipt
                 'tax' => $figures->refundTax,
                 'grand_total' => $figures->refundGrandTotal,
             ],
+            'tax_groups' => $taxGroups,
             'lines' => array_map(
-                static fn (\Acme\SellerRefund\Model\Total\RefundFigureLine $line): array => $line->toArray(),
-                $figures->lines
+                fn (RefundItemInterface $item): array => $this->lineData($item),
+                $items
             ),
+        ];
+    }
+
+    /**
+     * Build per-rate tax groups for the qualified invoice.
+     * Strictly filters for seller lines so mixed orders do not pollute seller tax records.
+     *
+     * @return array<int, array{rate: string, taxable: string, tax: string}>
+     */
+    private function buildTaxGroups(\Magento\Sales\Api\Data\OrderInterface $order): array
+    {
+        $sellerLines = $this->sellerLineResolver !== null
+            ? $this->sellerLineResolver->sellerLines($order)
+            : [];
+
+        // Fallback for isolated unit tests or orders where seller lines are not explicitly resolved
+        if (empty($sellerLines)) {
+            $sellerLines = $order->getAllVisibleItems() ?: [];
+        }
+
+        $groups = [];
+        foreach ($sellerLines as $orderItem) {
+            $row = $this->num($orderItem->getRowTotal());
+            $tax = $this->num($orderItem->getTaxAmount());
+            $rate = $this->resolveItemTaxRate($orderItem, $row, $tax);
+
+            if (!isset($groups[$rate])) {
+                $groups[$rate] = [
+                    'rate' => $rate,
+                    'taxable' => self::ZERO,
+                    'tax' => self::ZERO,
+                ];
+            }
+            $groups[$rate]['taxable'] = bcadd($groups[$rate]['taxable'], $row, self::SCALE);
+            $groups[$rate]['tax'] = bcadd($groups[$rate]['tax'], $tax, self::SCALE);
+        }
+
+        krsort($groups);
+
+        return array_values($groups);
+    }
+
+    private function resolveItemTaxRate(OrderItemInterface $orderItem, string $rowAmount, string $taxAmount): string
+    {
+        if ($this->taxCodeResolver !== null && $orderItem->getData('mp_tax_class') !== null) {
+            try {
+                $code = $this->taxCodeResolver->toBusinessCode((int) $orderItem->getData('mp_tax_class'));
+                return $this->taxCodeResolver->rateFor($code);
+            } catch (\Throwable) {
+                // Fall back to mathematical inference if attribute option mapping is absent
+            }
+        }
+
+        return $this->rateFor($rowAmount, $taxAmount);
+    }
+
+    /**
+     * @return array<string, string|int>
+     */
+    private function lineData(RefundItemInterface $item): array
+    {
+        return [
+            'order_item_id' => $item->getOrderItemId(),
+            'sku' => $item->getSku(),
+            'product_name' => $item->getProductName(),
+            'qty_refund' => $item->getQtyRefund(),
+            'refunded_before' => $item->getQtyRefundedBefore() ?: self::ZERO,
+            'tax_rate' => $item->getTaxRate(),
+            'row_amount' => $item->getRowAmount(),
+            'tax_amount' => $item->getTaxAmount(),
+            'grand_total' => $item->getGrandTotal(),
         ];
     }
 
@@ -97,6 +183,24 @@ class RefundReceipt
                 $this->money($lineData['grand_total'], $currency)
             );
             $y = $this->line($page, $text, $y);
+        }
+
+        // Tax Groups for Japanese Qualified Invoicing
+        if (!empty($data['tax_groups'])) {
+            $y -= 8;
+            $page->setFont($bold, 11);
+            $y = $this->line($page, 'Tax Breakdown by Rate (Qualified Invoice)', $y, 14);
+            $page->setFont($font, 10);
+            foreach ($data['tax_groups'] as $group) {
+                $ratePercent = bcmul((string) $group['rate'], '100', 0);
+                $text = sprintf(
+                    'Rate %s%%: Taxable %s  Consumption Tax %s',
+                    $ratePercent,
+                    $this->money($group['taxable'], $currency),
+                    $this->money($group['tax'], $currency)
+                );
+                $y = $this->line($page, $text, $y);
+            }
         }
 
         $y -= 8;
@@ -144,9 +248,33 @@ class RefundReceipt
         return $this->timezone->date(new \DateTime($createdAt))->format('Y-m-d');
     }
 
+    /**
+     * Derive the applied rate from a line's ex-tax amount and tax so lines can be grouped.
+     */
+    private function rateFor(string $rowAmount, string $taxAmount): string
+    {
+        if (bccomp($rowAmount, self::ZERO, self::SCALE) <= 0) {
+            return self::ZERO;
+        }
+
+        return bcdiv($taxAmount, $rowAmount, self::SCALE);
+    }
+
+    private function currency(\Magento\Sales\Api\Data\OrderInterface $order): string
+    {
+        $code = $order->getOrderCurrencyCode();
+
+        return $code !== null && $code !== '' ? (string) $code : 'JPY';
+    }
+
     private function money(mixed $amount, string $currency): string
     {
         return $currency . ' ' . number_format((float) $amount, 0, '.', ',');
+    }
+
+    private function num(mixed $value): string
+    {
+        return sprintf('%.4F', (float) $value);
     }
 
     private function ascii(string $value): string
