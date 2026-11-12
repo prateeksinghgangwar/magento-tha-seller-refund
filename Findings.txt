@@ -1,0 +1,30 @@
+Synchronous External HTTP Calls in Controller 
+Failure Mode: RefundController::execute synchronously invokes ErpRefundClient::create with a 30s timeout and 2 retries (up to 90s) within the user's web request.
+Impact: Any latency spike or timeout from the ERP during peak campaigns will saturate the finite PHP-FPM worker pool within seconds, returning HTTP 502/504 Bad Gateway errors to all storefront shoppers and admin operators.
+Resolution: Decouple using the Transactional Outbox Pattern (mp_refund_outbox), committing the local record and enqueueing the background task in a single MariaDB transaction (<50ms).
+
+
+Unprotected Active Refund Invariant BR-05:
+Failure Mode: The rule prohibiting concurrent refunds against the same order is enforced only in the application layer without database locking or unique constraints.
+Impact: Concurrent operator submissions or double-clicks produce race conditions where two threads read the same remaining balance, leading to double refunds and duplicate ERP credit notes.
+Resolution: Acquire a pessimistic database row lock (SELECT ... FOR UPDATE on sales_order) during submission or enforce a functional unique constraint on active refunds.
+
+
+Self-Inflicted DoS via 2-Second Polling:
+Failure Mode: 40 concurrent CS operators poll the server every 2 seconds, generating 1,200 dynamic requests/min.
+Impact: Continuous PHP bootstrapping, session locking, and DB querying degrades server I/O.
+Resolution: Transition to adaptive backoff polling (3s → 10s → 30s → stop) or Server-Sent Events (SSE).
+
+
+Worklist N+1 Queries & Lack of Pagination:
+Failure Mode: Loading orders and line items per row across an unpaginated collection.
+Impact: Memory exhaustion (Allowed memory size exhausted) and failure of the mandatory 1.5s first-page render SLA.
+Resolution: Enforce server-side pagination (pageSize = 50) and SQL join summaries (joinOrderSummary(), addLineSummary()).
+
+
+Dispersed Channel Presentation Logic:
+Failure Mode: Receipt PDF, storefront, email, and downstream sync derive amounts independently.
+Impact: Rounding divergences, mixed-order leakage, and conflicting tax invoices.
+Resolution: Mandate that RefundTotalCalculator::fromSnapshot() is the sole canonical source of truth DTO.
+
+

@@ -16,6 +16,7 @@ use Magento\Framework\Stdlib\DateTime\TimezoneInterface;
 use Magento\Sales\Api\Data\OrderItemInterface;
 use Magento\Sales\Api\OrderRepositoryInterface;
 use Magento\Sales\Model\Order;
+use Magento\Sales\Model\Order\Item as OrderItem;
 use PHPUnit\Framework\TestCase;
 
 /**
@@ -108,6 +109,7 @@ class RefundReceiptTest extends TestCase
         $orderRepository = $this->createMock(OrderRepositoryInterface::class);
         $calculator = $this->createMock(RefundTotalCalculator::class);
         $timezone = $this->createMock(TimezoneInterface::class);
+        $timezone->method('date')->willReturn(new \DateTime('2026-09-01 10:00:00'));
         $sellerLineResolver = $this->createMock(SellerLineResolver::class);
 
         $refund = $this->createMock(RefundInterface::class);
@@ -183,6 +185,7 @@ class RefundReceiptTest extends TestCase
         $orderRepository = $this->createMock(OrderRepositoryInterface::class);
         $calculator = $this->createMock(RefundTotalCalculator::class);
         $timezone = $this->createMock(TimezoneInterface::class);
+        $timezone->method('date')->willReturn(new \DateTime('2026-09-01 10:00:00'));
         $sellerLineResolver = $this->createMock(SellerLineResolver::class);
         $taxCodeResolver = $this->createMock(TaxCodeResolver::class);
 
@@ -193,14 +196,14 @@ class RefundReceiptTest extends TestCase
         $refund->method('getRefundType')->willReturn(RefundInterface::TYPE_FULL);
 
         // Seller line 1: 10% tax rate (mp_tax_class = 101 => '010' => 0.1000)
-        $line10 = $this->createMock(OrderItemInterface::class);
+        $line10 = $this->createMock(OrderItem::class);
         $line10->method('getItemId')->willReturn(1);
         $line10->method('getRowTotal')->willReturn(2000.0);
         $line10->method('getTaxAmount')->willReturn(200.0);
         $line10->method('getData')->with('mp_tax_class')->willReturn(101);
 
         // Seller line 2: 8% tax rate (mp_tax_class = 102 => '008' => 0.0800)
-        $line8 = $this->createMock(OrderItemInterface::class);
+        $line8 = $this->createMock(OrderItem::class);
         $line8->method('getItemId')->willReturn(2);
         $line8->method('getRowTotal')->willReturn(1000.0);
         $line8->method('getTaxAmount')->willReturn(80.0);

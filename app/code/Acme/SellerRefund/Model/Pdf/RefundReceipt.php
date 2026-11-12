@@ -116,7 +116,7 @@ class RefundReceipt
 
     private function resolveItemTaxRate(OrderItemInterface $orderItem, string $rowAmount, string $taxAmount): string
     {
-        if ($this->taxCodeResolver !== null && $orderItem->getData('mp_tax_class') !== null) {
+        if ($this->taxCodeResolver !== null && method_exists($orderItem, 'getData') && $orderItem->getData('mp_tax_class') !== null) {
             try {
                 $code = $this->taxCodeResolver->toBusinessCode((int) $orderItem->getData('mp_tax_class'));
                 return $this->taxCodeResolver->rateFor($code);
